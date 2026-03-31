@@ -122,7 +122,7 @@ def handle_submission(submissions, **info):
             }
         sub = test_result_sub["info"]["result"]
         if info["csq_mode"] != "raw":
-            sub = ast.literal_eval(sub, info)
+            sub = ast.literal_eval(sub)
     except Exception as err:
         msg = ""
         mfunc = info["csq_msg_function"]
