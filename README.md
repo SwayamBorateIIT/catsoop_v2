@@ -1,4 +1,4 @@
-[![Please don't upload to GitHub](https://nogithub.codeberg.page/badge.svg)](https://nogithub.codeberg.page)
+[![Please don't upload to GitHub](https://catsoop.org/_static/no_github_badge.svg)](https://sfconservancy.org/GiveUpGitHub/)
 
 ```
 \
