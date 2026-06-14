@@ -312,7 +312,7 @@ def _real_url_helper(context, url):
     elif url.startswith("COURSE"):
         new = [str(context["cs_course"])]
         floc = content_file_location(context, new + end)
-        new = new if sole_course is None else []
+        new = new if sole_course is None and new[0] == sole_course else []
         if floc is not None and os.path.isfile(floc):
             pre = u2 + new
         else:
@@ -324,7 +324,7 @@ def _real_url_helper(context, url):
         if test_file.rsplit(".", 1)[0] != "content":
             new = new[:-1]
         floc = content_file_location(context, new + end)
-        if sole_course:
+        if sole_course and new[0] == sole_course:
             new = new[1:]
         if floc is not None and os.path.isfile(floc):
             pre = u2 + new
@@ -495,9 +495,14 @@ def _breadcrumbs_html(context):
         return ""
     elements = []
     to_skip = context.get("cs_breadcrumbs_skip_paths", [])
+    sole_course = getattr(base_context, "cs_sole_course", None)
     link = "BASE"
     for ix, elt in enumerate(context["cs_loader_states"]):
-        if ix == 0 and getattr(base_context, "cs_sole_course", None) is not None:
+        if (
+            ix == 0
+            and sole_course is not None
+            and sole_course == context.get("cs_course", None)
+        ):
             link = "COURSE"
         else:
             link = link + "/" + context["cs_path_info"][ix]
@@ -632,6 +637,15 @@ def get_client_ipaddr(environment):
         return environment["HTTP_X_FORWARDED_FOR"].split(",")[-1].strip()
     except KeyError:
         return environment["REMOTE_ADDR"]
+
+
+def _get_base_url(context):
+    path_info = context["cs_path_info"]
+    sole_course = context.get("cs_sole_course", None)
+    if sole_course is not None and path_info[0] == sole_course:
+        path_info = path_info[1:]
+    base_url = "/".join([context["cs_url_root"]] + path_info)
+    return base_url
 
 
 def main(environment, return_context=False, form_data=None):
@@ -800,10 +814,7 @@ def main(environment, return_context=False, form_data=None):
                     return display_page(context)
                 redir = None
                 if user_info.get("cs_reload", False):
-                    redir = "/".join(
-                        [context.get("cs_url_root", base_context.cs_url_root)]
-                        + context["cs_path_info"]
-                    )
+                    redir = _get_base_url(context)
                     if session_data.get("cs_query_string", ""):
                         redir += "?" + session_data["cs_query_string"]
                 if redir is None:
@@ -824,7 +835,7 @@ def main(environment, return_context=False, form_data=None):
             menu = context.get("cs_top_menu", None)
             if isinstance(menu, list) and context.get("cs_auth_required", True):
                 uname = context["cs_username"]
-                base_url = "/".join([context["cs_url_root"]] + context["cs_path_info"])
+                base_url = _get_base_url(context)
                 if str(uname) == "None":
                     menu.append(
                         {"text": "Log In", "link": "%s?loginaction=login" % base_url}

@@ -20,6 +20,8 @@ import struct
 import hashlib
 import secrets
 
+from catsoop.dispatch import _get_base_url
+
 
 def user_settings_links(context):
     url = _get_base_url(context)
@@ -594,10 +596,6 @@ def compute_password_hash(
 
 def generate_confirmation_token():
     return secrets.token_urlsafe(40)
-
-
-def _get_base_url(context):
-    return "/".join([context["cs_url_root"]] + context["cs_path_info"])
 
 
 def generate_forgot_password_form(context):
