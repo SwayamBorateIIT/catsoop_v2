@@ -31,6 +31,8 @@ import collections.abc
 
 from bs4 import BeautifulSoup
 
+from catsoop.dispatch import _get_base_url
+
 _prefix = "cs_defaulthandler_"
 
 
@@ -2319,7 +2321,7 @@ catsoop.viewans_confirm = "Are you sure?  Viewing the answer will prevent any fu
         "skipalert": json.dumps(skip_alert),
         "allqs": list(context[_n("name_map")].keys()),
         "user": context[_n("real_uname")],
-        "path": "/".join([context["cs_url_root"]] + context["cs_path_info"]),
+        "path": _get_base_url(context),
         "imp": context[_n("uname")] if context[_n("impersonating")] else "",
         "course": repr(context["cs_course"]) if context["cs_course"] else "null",
         "pathinfo": context["cs_path_info"],
