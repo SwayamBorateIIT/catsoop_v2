@@ -312,7 +312,7 @@ def _real_url_helper(context, url):
     elif url.startswith("COURSE"):
         new = [str(context["cs_course"])]
         floc = content_file_location(context, new + end)
-        new = new if sole_course is None or new[0] == sole_course else []
+        new = new if sole_course is None else []
         if floc is not None and os.path.isfile(floc):
             pre = u2 + new
         else:
