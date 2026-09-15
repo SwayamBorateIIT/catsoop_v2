@@ -10,6 +10,7 @@
 * Halvard Hummel
 * Jeremy Kaplan
 * Katrina LaCurts
+* Madison Landry
 * Tomas Lozano-Perez
 * Sanjoy Mahajan
 * Kade Phillips
