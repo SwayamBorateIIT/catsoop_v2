@@ -1,5 +1,6 @@
 # Git hash from installing
 catsoop/dev.hash
+.venv/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
