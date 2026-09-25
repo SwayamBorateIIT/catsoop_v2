@@ -187,6 +187,7 @@ def main():
             maintainer_email="hz@mit.edu",
             packages=[
                 "catsoop",
+                "catsoop.analytics",
                 "catsoop.test",
                 "catsoop.thirdparty",
                 "catsoop.thirdparty.oauth2",
