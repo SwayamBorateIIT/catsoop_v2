@@ -388,6 +388,178 @@ class TestGroundTruth(AnalyticsTestBase):
         )
 
 
+class TestConcurrency(AnalyticsTestBase):
+    """
+    Two syncs running at once must not double-count.
+
+    This is a regression suite for a real defect: the store had no uniqueness
+    constraint and the sync took no lock, so two staff opening the dashboard at
+    the same moment each read the same records and each inserted them.  Only
+    the event-derived metrics were affected (activity and time on task), since
+    score and completion come from `problemstate`, which is overwritten rather
+    than appended.
+    """
+
+    COURSE = "conc"
+    PATH = ["hw1"]
+
+    def _seed(self, n=3):
+        from .. import cslog
+
+        for i in range(n):
+            cslog.update_log(
+                "alice", [self.COURSE] + self.PATH, "problemactions",
+                {
+                    "action": "submit",
+                    "timestamp": "2026-09-18:10:0%d:00.000000" % i,
+                    "names": ["q1"],
+                    "scores": {"q1": True},
+                    "user_info": {"username": "alice"},
+                },
+            )
+
+    def test_inserting_the_same_events_twice_does_not_duplicate(self):
+        """The store itself refuses duplicates, independent of any lock."""
+        from ..analytics import extract, normalize, store
+
+        self._seed(3)
+        records, _offset, _reset = extract.read_actions_since(
+            "alice", [self.COURSE] + self.PATH, 0
+        )
+        events, _ = normalize.normalize_actions(
+            self.COURSE, "alice", [self.COURSE] + self.PATH, records
+        )
+        self.assertEqual(len(events), 3)
+
+        conn = store.connect()
+        try:
+            store.insert_events(conn, events)
+            store.insert_events(conn, events)   # the overlapping sync
+            conn.commit()
+            n = conn.execute(
+                "SELECT COUNT(*) FROM event WHERE course_id = ?", (self.COURSE,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(n, 3, "the same events were counted twice")
+
+    def test_two_overlapping_workers_do_not_duplicate(self):
+        """
+        The exact failure that was observed: two connections each read the
+        cursor before either committed, so both believed they had new records.
+        """
+        from ..analytics import extract, normalize, store
+
+        self._seed(1)
+        records, offset, _ = extract.read_actions_since(
+            "alice", [self.COURSE] + self.PATH, 0
+        )
+        events, _ = normalize.normalize_actions(
+            self.COURSE, "alice", [self.COURSE] + self.PATH, records
+        )
+
+        c1, c2 = store.connect(), store.connect()
+        try:
+            store.get_cursors(c1, self.COURSE)      # both read the same
+            store.get_cursors(c2, self.COURSE)      # starting position
+            for conn in (c1, c2):
+                store.insert_events(conn, events)
+                store.set_cursor(
+                    conn, self.COURSE, "alice", [self.COURSE] + self.PATH,
+                    "problemactions", offset, 1.0,
+                )
+                conn.commit()
+            n = c1.execute(
+                "SELECT COUNT(*) FROM event WHERE course_id = ?", (self.COURSE,)
+            ).fetchone()[0]
+        finally:
+            c1.close()
+            c2.close()
+        self.assertEqual(n, 1, "one submission produced %d rows" % n)
+
+    def test_activity_counts_are_not_inflated(self):
+        """The metric that the defect actually corrupted."""
+        from ..analytics import engine, store, sync
+
+        self._seed(3)
+        sync.sync_course(self.COURSE)
+        sync.sync_course(self.COURSE)
+        conn = store.connect()
+        try:
+            total = sum(
+                d["attempts"]
+                for d in engine.activity_series(conn, self.COURSE, 365, True)
+            )
+        finally:
+            conn.close()
+        self.assertEqual(total, 3, "activity was counted %d times" % total)
+
+    def test_second_sync_is_skipped_while_the_lock_is_held(self):
+        """A caller that cannot get the lock reports it instead of duplicating."""
+        from ..analytics import sync
+
+        self._seed(2)
+        lock = sync._course_lock(self.COURSE)
+        lock.acquire()
+        try:
+            report = sync.sync_course(self.COURSE, lock_timeout=0.1)
+        finally:
+            lock.release()
+
+        self.assertTrue(report.skipped, "sync ran while the lock was held")
+        self.assertEqual(report.records, 0)
+        self.assertIsNone(report.error)
+        self.assertIn("skipped", repr(report))
+
+    def test_sync_works_once_the_lock_is_free(self):
+        from ..analytics import sync
+
+        self._seed(2)
+        lock = sync._course_lock(self.COURSE)
+        lock.acquire()
+        lock.release()
+        report = sync.sync_course(self.COURSE, lock_timeout=1.0)
+        self.assertFalse(report.skipped)
+        self.assertEqual(report.records, 2)
+
+    def test_existing_duplicates_are_cleaned_up_on_open(self):
+        """
+        A store written before the fix may already hold duplicates.  Opening it
+        removes them, keeping one of each, so the index can be created.
+        """
+        from ..analytics import store
+
+        conn = store.connect()
+        try:
+            conn.execute("DROP INDEX IF EXISTS event_natural_key")
+            row = (self.COURSE, "alice", "conc/hw1", "q1", "attempt",
+                   "submit", 1.0, 1789772600.0, 0)
+            for _ in range(3):
+                conn.execute(
+                    "INSERT INTO event (course_id, username, path, qname, kind,"
+                    " action, score, ts, impersonated)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", row,
+                )
+            conn.commit()
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM event").fetchone()[0], 3
+            )
+        finally:
+            conn.close()
+
+        conn = store.connect()        # reopening runs the cleanup
+        try:
+            n = conn.execute("SELECT COUNT(*) FROM event").fetchone()[0]
+            has_index = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='index'"
+                " AND name='event_natural_key'"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(n, 1, "duplicates were not cleaned up")
+        self.assertIsNotNone(has_index, "unique index was not recreated")
+
+
 class TestAccessControl(AnalyticsTestBase):
     def _ctx(self, perms):
         return {
