@@ -130,7 +130,9 @@ def _header(ctx, course, meta, report, explanation, include_staff):
         freshness = "Data as of <b>%s</b> (%s)" % (
             render.esc(when), render.esc(render.ago(meta["last_sync"]))
         )
-        if report and report.events:
+        if report and getattr(report, "skipped", False):
+            pass  # the banner says why below; do not claim a refresh happened
+        elif report and report.events:
             freshness += " &middot; picked up %d new event%s just now" % (
                 report.events, "" if report.events == 1 else "s"
             )
@@ -142,6 +144,11 @@ def _header(ctx, course, meta, report, explanation, include_staff):
 
     if explanation:
         bits.append(render.esc(explanation))
+    if report and getattr(report, "skipped", False):
+        bits.append(
+            "Another refresh is already running, so this view is from the last "
+            "completed one."
+        )
     if report and report.error:
         bits.append("Sync failed: <b>%s</b>" % render.esc(report.error))
     if report and report.anomalies:
