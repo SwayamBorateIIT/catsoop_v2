@@ -21,7 +21,16 @@ the second run reads zero records.
 
 import time
 
+from filelock import Timeout
+
+from .. import cslog
 from . import extract, normalize, store
+
+#: How long a caller waits for another sync to finish before giving up.  A page
+#: load should not block behind the nightly job, so the default is short; the
+#: CLI passes a longer one.
+INLINE_LOCK_TIMEOUT = 10.0
+BATCH_LOCK_TIMEOUT = 600.0
 
 
 class SyncReport:
@@ -35,6 +44,8 @@ class SyncReport:
         self.resets = 0
         self.seconds = 0.0
         self.error = None
+        #: True when another sync held the lock and this one did nothing.
+        self.skipped = False
 
     def as_dict(self):
         return {
@@ -46,10 +57,13 @@ class SyncReport:
             "anomalies": self.anomalies,
             "resets": self.resets,
             "seconds": round(self.seconds, 3),
+            "skipped": self.skipped,
             "error": self.error,
         }
 
     def __repr__(self):
+        if self.skipped:
+            return "<SyncReport %s: skipped, another sync in progress>" % self.course
         return "<SyncReport %s: %d/%d logs, %d events, %d anomalies in %.2fs>" % (
             self.course, self.logs_read, self.logs_seen, self.events,
             self.anomalies, self.seconds,
@@ -82,11 +96,42 @@ def count_pending(course):
     return pending
 
 
-def sync_course(course, conn=None):
-    """Bring the analytics store up to date for one course.  Returns a SyncReport."""
+def _course_lock(course):
+    """
+    A cross-process lock for one course's sync.
+
+    Reuses CAT-SOOP's own file-lock helper, so it holds across the web server
+    and the scheduled job, which are separate processes.  Without it, two
+    syncs starting together both read the same cursor position, both read the
+    same records, and both insert them.
+    """
+    return cslog.log_lock(["_analytics", "sync", course])
+
+
+def sync_course(course, conn=None, lock_timeout=INLINE_LOCK_TIMEOUT):
+    """
+    Bring the analytics store up to date for one course.  Returns a SyncReport.
+
+    Only one sync per course runs at a time.  A caller that cannot get the lock
+    within `lock_timeout` returns a report with `skipped` set rather than
+    waiting or duplicating the work; the dashboard then serves the data the
+    other sync is in the middle of writing, which is correct and current.
+    """
     report = SyncReport(course)
     started = time.time()
     own_conn = conn is None
+    lock = _course_lock(course)
+    try:
+        lock.acquire(timeout=lock_timeout)
+    except Timeout:
+        report.skipped = True
+        report.seconds = time.time() - started
+        return report
+    except Exception as exc:
+        report.error = "could not acquire sync lock: %s" % exc
+        report.seconds = time.time() - started
+        return report
+
     try:
         extract.check_readable()
         conn = conn or store.connect()
@@ -184,6 +229,7 @@ def sync_course(course, conn=None):
     finally:
         if own_conn and conn is not None:
             conn.close()
+        lock.release()
     return report
 
 
@@ -236,9 +282,9 @@ def _write_daily_snapshot(conn, course):
     )
 
 
-def sync_all():
+def sync_all(lock_timeout=BATCH_LOCK_TIMEOUT):
     """Sync every course that has logs.  This is what the daily job runs."""
     reports = []
     for course in extract.list_courses():
-        reports.append(sync_course(course))
+        reports.append(sync_course(course, lock_timeout=lock_timeout))
     return reports
