@@ -10,6 +10,7 @@ behaviour must produce.
 import os
 import shutil
 import tempfile
+import time
 import unittest
 
 from .. import base_context
@@ -558,6 +559,396 @@ class TestConcurrency(AnalyticsTestBase):
             conn.close()
         self.assertEqual(n, 1, "duplicates were not cleaned up")
         self.assertIsNotNone(has_index, "unique index was not recreated")
+
+
+class TestDiscrimination(AnalyticsTestBase):
+    """
+    Discrimination must tell a *working* question from a broken one.
+
+    The cohort is built so the right answer is known by construction: four
+    strong students and four weak ones, with questions whose outcome is fixed
+    rather than random.
+    """
+
+    COURSE = "disc"
+    PATH = ["hw1"]
+    STRONG = ["s1", "s2", "s3", "s4"]
+    WEAK = ["w1", "w2", "w3", "w4"]
+
+    def _state(self, user, scores):
+        self.write_state(self.COURSE, user, self.PATH, {
+            "scores": scores,
+            "nsubmits_used": {q: 1 for q in scores},
+            "last_submit_times": {
+                q: "2026-09-18:10:00:00.000000" for q in scores
+            },
+        })
+
+    def setUp(self):
+        super().setUp()
+        from .. import cslog
+
+        # q_good   tracks ability            -> strongly positive
+        # q_broken reversed                  -> negative, the alarm case
+        # q_flat   everybody right           -> no separation at all
+        # q_rank   gives the strong group their ranking
+        for u in self.STRONG:
+            self._state(u, {"q_good": True, "q_broken": False,
+                            "q_flat": True, "q_rank": True})
+        for u in self.WEAK:
+            self._state(u, {"q_good": False, "q_broken": True,
+                            "q_flat": True, "q_rank": False})
+
+        users_dir = os.path.join(self.tmp, "courses", self.COURSE, "__USERS__")
+        os.makedirs(users_dir, exist_ok=True)
+        for u in self.STRONG + self.WEAK:
+            with open(os.path.join(users_dir, "%s.py" % u), "w") as f:
+                f.write("name = %r\nemail = ''\nrole = 'Student'\n" % u)
+
+        cslog.overwrite_log(
+            "_question_info", [self.COURSE] + self.PATH, "question_info",
+            {"timestamp": "1789772600.0", "questions": repr({
+                q: {"qtype": "multiplechoice", "csq_npoints": 1,
+                    "csq_display_name": q}
+                for q in ("q_good", "q_broken", "q_flat", "q_rank")
+            })},
+        )
+
+        from ..analytics import store, sync
+        report = sync.sync_course(self.COURSE)
+        self.assertIsNone(report.error, report.error)
+        self.conn = store.connect()
+
+    def tearDown(self):
+        self.conn.close()
+        super().tearDown()
+
+    def _by_name(self):
+        from ..analytics import engine
+        return {r["qname"]: r
+                for r in engine.question_discrimination(self.conn, self.COURSE)}
+
+    def test_a_working_question_discriminates_positively(self):
+        d = self._by_name()["q_good"]
+        self.assertEqual(d["top_pass"], 1.0)
+        self.assertEqual(d["bottom_pass"], 0.0)
+        self.assertAlmostEqual(d["discrimination"], 1.0)
+
+    def test_a_reversed_question_comes_out_negative(self):
+        """The alarm case: strong students fail, weak students pass."""
+        d = self._by_name()["q_broken"]
+        self.assertAlmostEqual(d["discrimination"], -1.0)
+
+    def test_a_question_everyone_passes_separates_nobody(self):
+        d = self._by_name()["q_flat"]
+        self.assertAlmostEqual(d["discrimination"], 0.0)
+
+    def test_the_suspect_question_is_listed_first(self):
+        from ..analytics import engine
+        rows = engine.question_discrimination(self.conn, self.COURSE)
+        self.assertEqual(rows[0]["qname"], "q_broken",
+                         "the suspect question must surface at the top")
+
+    def test_comparison_groups_never_overlap(self):
+        """A student must never be compared against themselves."""
+        from ..analytics import engine
+        for r in engine.question_discrimination(self.conn, self.COURSE):
+            self.assertEqual(r["n_top"], r["group_size"])
+            self.assertEqual(r["n_bottom"], r["group_size"])
+            self.assertEqual(r["n_top"] + r["n_bottom"], 8)
+
+    def test_odd_cohort_drops_the_middle_student(self):
+        """With an odd number, nobody may appear in both groups."""
+        from ..analytics import engine, store, sync
+
+        self._state("extra", {"q_good": True, "q_broken": False,
+                              "q_flat": True, "q_rank": True})
+        users_dir = os.path.join(self.tmp, "courses", self.COURSE, "__USERS__")
+        with open(os.path.join(users_dir, "extra.py"), "w") as f:
+            f.write("name = 'extra'\nemail = ''\nrole = 'Student'\n")
+        sync.sync_course(self.COURSE)
+
+        conn = store.connect()
+        try:
+            rows = engine.question_discrimination(conn, self.COURSE)
+        finally:
+            conn.close()
+        self.assertTrue(rows)
+        for r in rows:
+            self.assertEqual(r["group_size"], 4)        # 9 // 2
+            self.assertEqual(r["n_top"] + r["n_bottom"], 8)   # middle excluded
+
+    def test_a_gap_of_one_student_is_not_given_a_verdict(self):
+        """
+        The measure cannot resolve anything finer than one student, so a gap
+        that small must be reported as inconclusive rather than "suspect".
+        """
+        from ..analytics import engine
+
+        # Five a side: every gap is a multiple of 0.20.
+        self.assertEqual(engine.discrimination_band(-0.20, 5)[0], "inconclusive")
+        self.assertEqual(engine.discrimination_band(0.20, 5)[0], "inconclusive")
+        # Two students' worth is a real signal.
+        self.assertEqual(engine.discrimination_band(-0.40, 5)[0], "suspect")
+
+    def test_bands_describe_the_values(self):
+        from ..analytics import engine
+        self.assertEqual(engine.discrimination_band(-0.3)[0], "suspect")
+        self.assertEqual(engine.discrimination_band(0.1)[0], "weak")
+        self.assertEqual(engine.discrimination_band(0.3)[0], "acceptable")
+        self.assertEqual(engine.discrimination_band(0.8)[0], "excellent")
+        self.assertEqual(engine.discrimination_band(None)[0], "no data")
+
+    def test_too_few_attempts_reports_nothing(self):
+        """A question only one group attempted cannot be compared."""
+        from ..analytics import engine, store, sync
+        from .. import cslog
+
+        # Only the strong group attempts this one.
+        for u in self.STRONG:
+            prior = cslog.most_recent(
+                u, [self.COURSE] + self.PATH, "problemstate", {}
+            )
+            scores = dict(prior.get("scores") or {})
+            scores["q_strong_only"] = True
+            self._state(u, scores)
+        sync.sync_course(self.COURSE)
+
+        conn = store.connect()
+        try:
+            names = {r["qname"]
+                     for r in engine.question_discrimination(conn, self.COURSE)}
+        finally:
+            conn.close()
+        self.assertNotIn("q_strong_only", names)
+
+
+class TestBackgroundSync(AnalyticsTestBase):
+    def test_background_sync_does_the_work_without_blocking(self):
+        from .. import cslog
+        from ..analytics import page, store
+
+        cslog.update_log("alice", ["bg", "hw1"], "problemactions", {
+            "action": "submit", "timestamp": "2026-09-18:10:00:00.000000",
+            "names": ["q1"], "scores": {"q1": True},
+            "user_info": {"username": "alice"},
+        })
+        page._sync_in_background("bg")
+
+        n = 0
+        for _ in range(100):
+            time.sleep(0.05)
+            conn = store.connect(readonly=True)
+            try:
+                n = conn.execute(
+                    "SELECT COUNT(*) FROM event WHERE course_id = 'bg'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+            if n:
+                break
+        self.assertEqual(n, 1, "background sync never wrote the event")
+
+    def test_background_sync_swallows_failures(self):
+        """A broken sync must not be able to take the page down."""
+        from ..analytics import page, sync
+
+        original = sync.sync_course
+        sync.sync_course = lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("boom")
+        )
+        try:
+            page._sync_in_background("bg")     # must not raise
+            time.sleep(0.3)
+        finally:
+            sync.sync_course = original
+
+
+class TestTabulate(AnalyticsTestBase):
+    """
+    The log-inspection tables.
+
+    These matter because the tables are what you check the dashboard against.
+    If they are wrong, they will agree with a wrong dashboard and nobody will
+    notice, so they read the log files directly rather than the store.
+    """
+
+    COURSE = "tab"
+    PATH = ["hw1"]
+
+    def setUp(self):
+        super().setUp()
+        from .. import cslog
+
+        def submit(user, q, ok, when, staff=None):
+            info = {"username": user}
+            if staff:
+                info["real_user"] = {"username": staff}
+            return {
+                "action": "submit", "timestamp": when,
+                "names": [q], "scores": {q: ok},
+                "user_info": info,
+            }
+
+        self.write_actions(self.COURSE, "zoe", self.PATH, [
+            {"action": "view", "timestamp": "2026-09-18:10:00:00.000000",
+             "user_info": {"username": "zoe"}},
+            submit("zoe", "q1", False, "2026-09-18:10:05:00.000000"),
+            submit("zoe", "q1", True, "2026-09-18:10:09:00.000000"),
+            submit("zoe", "q2", True, "2026-09-18:10:12:00.000000"),
+            # a staff member testing q3 while impersonating zoe
+            submit("zoe", "q3", True, "2026-09-19:09:00:00.000000", staff="prof"),
+        ])
+        self.write_state(self.COURSE, "zoe", self.PATH, {
+            "scores": {"q1": True, "q2": True},
+            "nsubmits_used": {"q1": 2, "q2": 1},
+            "last_submit_times": {
+                "q1": "2026-09-18:10:09:00.000000",
+                "q2": "2026-09-18:10:12:00.000000",
+            },
+        })
+
+        users_dir = os.path.join(self.tmp, "courses", self.COURSE, "__USERS__")
+        os.makedirs(users_dir, exist_ok=True)
+        for u, role in (("zoe", "Student"), ("prof", "Admin")):
+            with open(os.path.join(users_dir, "%s.py" % u), "w") as f:
+                f.write("name = %r\nemail = ''\nrole = %r\n" % (u.title(), role))
+
+        cslog.overwrite_log(
+            "_question_info", [self.COURSE] + self.PATH, "question_info",
+            {"timestamp": "1789772600.0", "questions": repr({
+                "q1": {"qtype": "number", "csq_npoints": 1,
+                       "csq_display_name": "q1"},
+                "q2": {"qtype": "multiplechoice", "csq_npoints": 1,
+                       "csq_display_name": "q2"},
+            })},
+        )
+
+    def test_events_are_in_chronological_order(self):
+        from ..analytics import tabulate
+
+        rows = tabulate.events(self.COURSE, "zoe")
+        self.assertEqual(len(rows), 5)
+        whens = [r["when"] for r in rows]
+        self.assertEqual(whens, sorted(whens))
+
+    def test_an_activity_row_has_no_score(self):
+        """A page view has no question, so 'not graded' would be misleading."""
+        from ..analytics import tabulate
+
+        views = [r for r in tabulate.events(self.COURSE, "zoe")
+                 if r["action"] == "view"]
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0]["score"], "")
+        self.assertEqual(views[0]["question"], "")
+
+    def test_scores_read_as_words_not_numbers(self):
+        from ..analytics import tabulate
+
+        rows = {(r["question"], r["when"]): r
+                for r in tabulate.events(self.COURSE, "zoe")}
+        got = sorted(r["score"] for r in rows.values() if r["question"] == "q1")
+        self.assertEqual(got, ["correct", "wrong"])
+
+    def test_staff_submissions_are_labelled_and_can_be_excluded(self):
+        from ..analytics import tabulate
+
+        rows = tabulate.events(self.COURSE, "zoe")
+        staff = [r for r in rows if r["by"] == "staff"]
+        self.assertEqual(len(staff), 1)
+        self.assertEqual(staff[0]["question"], "q3")
+
+        without = tabulate.events(self.COURSE, "zoe", include_staff=False)
+        self.assertEqual(len(without), 4)
+        self.assertTrue(all(r["by"] == "student" for r in without))
+
+    def test_views_can_be_excluded(self):
+        from ..analytics import tabulate
+
+        rows = tabulate.events(self.COURSE, "zoe", include_views=False)
+        self.assertTrue(rows)
+        self.assertNotIn("view", {r["action"] for r in rows})
+
+    def test_state_reports_catsoops_own_attempt_counter(self):
+        from ..analytics import tabulate
+
+        rows = {r["question"]: r for r in tabulate.state(self.COURSE, "zoe")}
+        self.assertEqual(rows["q1"]["attempts"], 2)
+        self.assertEqual(rows["q1"]["score"], "correct")
+        self.assertEqual(rows["q1"]["type"], "number")
+        self.assertEqual(rows["q2"]["type"], "multiplechoice")
+
+    def test_roster_reconciles_submissions_attempts_and_staff(self):
+        """
+        The three counts can legitimately differ, so the table shows all three.
+
+        Here the history holds 5 events: 1 view, 3 submissions by zoe, and 1
+        made by staff while impersonating her.  CAT-SOOP's own counter records
+        3 attempts (two on q1, one on q2), which happens to match her own
+        submissions exactly -- and that agreement is only visible because the
+        staff submission is counted separately rather than folded in.
+        """
+        from ..analytics import tabulate
+
+        rows = {r["username"]: r for r in tabulate.roster(self.COURSE)}
+        zoe = rows["zoe"]
+        self.assertEqual(zoe["submissions"], 3)   # staff excluded by default
+        self.assertEqual(zoe["staff"], 1)
+        self.assertEqual(zoe["attempts"], 3)      # 2 on q1 + 1 on q2
+        # Including staff, the history has one more.
+        with_staff = {r["username"]: r
+                      for r in tabulate.roster(self.COURSE, include_staff=True)}
+        self.assertEqual(with_staff["zoe"]["submissions"], 4)
+        self.assertEqual(zoe["questions"], 2)
+        self.assertEqual(zoe["modules"], 1)
+
+    def test_a_student_with_no_activity_shows_never(self):
+        from ..analytics import tabulate
+
+        users_dir = os.path.join(self.tmp, "courses", self.COURSE, "__USERS__")
+        with open(os.path.join(users_dir, "ghost.py"), "w") as f:
+            f.write("name = 'Ghost'\nemail = ''\nrole = 'Student'\n")
+        rows = {r["username"]: r for r in tabulate.roster(self.COURSE)}
+        self.assertEqual(rows["ghost"]["last seen"], "never")
+        self.assertEqual(rows["ghost"]["submissions"], 0)
+
+    def test_renderers_produce_their_formats(self):
+        from ..analytics import tabulate
+
+        rows = tabulate.events(self.COURSE, "zoe")
+        text = tabulate.render(rows, "text")
+        self.assertIn("WHEN", text)
+        self.assertIn("MODULE", text)
+
+        csv_out = tabulate.render(rows, "csv")
+        self.assertTrue(csv_out.startswith("when,module,question"))
+        self.assertEqual(len(csv_out.strip().splitlines()), len(rows) + 1)
+
+        md = tabulate.render(rows, "md")
+        self.assertTrue(md.startswith("| when |"))
+        self.assertIn("|---|", md)
+
+    def test_empty_input_does_not_crash_any_renderer(self):
+        from ..analytics import tabulate
+
+        self.assertEqual(tabulate.as_text([]), "(no rows)")
+        self.assertEqual(tabulate.as_csv([]), "")
+        self.assertIn("no rows", tabulate.as_markdown([]))
+
+    def test_unknown_format_is_rejected(self):
+        from ..analytics import tabulate
+
+        with self.assertRaises(ValueError):
+            tabulate.render([{"a": 1}], "xml")
+
+    def test_long_values_are_truncated_not_wrapped(self):
+        """A wide cell must not break the column alignment."""
+        from ..analytics import tabulate
+
+        rows = [{"col": "x" * 200}, {"col": "short"}]
+        out = tabulate.as_text(rows, max_width=20)
+        for line in out.splitlines():
+            self.assertLessEqual(len(line), 22)
 
 
 class TestAccessControl(AnalyticsTestBase):

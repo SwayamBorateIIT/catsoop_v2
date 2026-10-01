@@ -339,6 +339,118 @@ def question_difficulty(conn, course, include_impersonated=False, mastery=MASTER
     return out
 
 
+# ------------------------------------------------- question discrimination
+
+
+#: Fraction of the cohort in each comparison group.  0.5 means "top half
+#: against bottom half", which is the easiest version to explain and needs no
+#: statistics beyond counting.  Classical item analysis often uses 0.27.
+DISCRIM_GROUP = 0.5
+
+
+def question_discrimination(conn, course, include_impersonated=False,
+                            mastery=MASTERY):
+    """
+    Does each question separate stronger students from weaker ones?
+
+    Difficulty alone cannot tell you whether a question is *working*.  A
+    question everybody passes and a question everybody fails are both useless
+    for telling students apart, however different their difficulty scores look.
+
+    The measure is the classical discrimination index, computed the simple way:
+    rank students by their overall mean score, split into a top group and a
+    bottom group, and subtract.
+
+        D = (top group who got it right) - (bottom group who got it right)
+
+    Read it as:
+
+        D >= 0.40   excellent    strong students pass, weak ones do not
+        0.20-0.39   acceptable
+        0.00-0.19   weak         barely separates anyone
+        D < 0       suspect      *stronger* students do worse, which usually
+                                 means a mis-keyed answer or misleading wording
+
+    A negative D is the useful alarm, and the reason this is worth having
+    alongside difficulty: it points at questions that are not merely hard but
+    probably wrong.
+    """
+    cohort = set(students(conn, course))
+    if not cohort:
+        return []
+
+    rows = conn.execute(
+        "SELECT username, path, qname, score FROM state"
+        " WHERE course_id = ? AND score IS NOT NULL",
+        (course,),
+    ).fetchall()
+    rows = [r for r in rows if r["username"] in cohort]
+    if not rows:
+        return []
+
+    # Each student's overall standing, used only for ranking.
+    per_student = {}
+    for r in rows:
+        per_student.setdefault(r["username"], []).append(r["score"])
+    ranked = sorted(
+        per_student,
+        key=lambda u: sum(per_student[u]) / len(per_student[u]),
+        reverse=True,
+    )
+    # Floor division, so the two groups can never overlap.  With an odd number
+    # of students the middle one is left out of both rather than counted in
+    # each, which would compare a student against themselves.
+    group_n = int(len(ranked) * DISCRIM_GROUP)
+    if group_n < 2:
+        return []           # too few students for the comparison to mean much
+    top, bottom = set(ranked[:group_n]), set(ranked[-group_n:])
+    assert not (top & bottom), "comparison groups must be disjoint"
+
+    meta = {(e["path"], e["qname"]): e for e in exercises(conn, course)}
+    grouped = {}
+    for r in rows:
+        grouped.setdefault((r["path"], r["qname"]), []).append(r)
+
+    out = []
+    for key, rs in grouped.items():
+        t = [r for r in rs if r["username"] in top]
+        b = [r for r in rs if r["username"] in bottom]
+        if not t or not b:
+            continue        # not attempted by both groups; nothing to compare
+        t_pass = sum(1 for r in t if r["score"] >= mastery) / len(t)
+        b_pass = sum(1 for r in b if r["score"] >= mastery) / len(b)
+        info = meta.get(key, {})
+        out.append(
+            {
+                "path": key[0],
+                "qname": key[1],
+                "qtype": info.get("qtype") or "unknown",
+                "top_pass": t_pass,
+                "bottom_pass": b_pass,
+                "discrimination": t_pass - b_pass,
+                "n_top": len(t),
+                "n_bottom": len(b),
+                "group_size": group_n,
+            }
+        )
+    # Worst first: a negative value is the thing worth looking at.
+    out.sort(key=lambda d: d["discrimination"])
+    return out
+
+
+def discrimination_band(value):
+    """(label, status-colour-token) for a discrimination value."""
+    if value is None:
+        return "no data", "var(--ink-soft)"
+    if value < 0:
+        return "suspect", "var(--critical)"
+    if value < 0.20:
+        return "weak", "var(--serious)"
+    if value < 0.40:
+        return "acceptable", "var(--series-1)"
+    return "excellent", "var(--good)"
+
+
 # ------------------------------------------------------------------ FR6
 
 

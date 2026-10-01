@@ -111,6 +111,14 @@ CREATE TABLE IF NOT EXISTS snapshot (
     PRIMARY KEY (course_id, day, key)
 );
 
+-- An event is uniquely identified by who did what, where, and exactly when.
+-- CAT-SOOP timestamps carry microseconds, so two distinct actions cannot
+-- collide; a collision therefore means the same record was read twice, which
+-- is what happens if two syncs overlap.  `qname` is coalesced because activity
+-- events carry no question, and SQLite treats NULLs as distinct in an index.
+CREATE UNIQUE INDEX IF NOT EXISTS event_natural_key ON event
+    (course_id, username, path, kind, action, ts, COALESCE(qname, ''));
+
 CREATE INDEX IF NOT EXISTS event_course_ts   ON event (course_id, ts);
 CREATE INDEX IF NOT EXISTS event_course_q    ON event (course_id, path, qname);
 CREATE INDEX IF NOT EXISTS event_course_user ON event (course_id, username, ts);
@@ -121,6 +129,31 @@ CREATE INDEX IF NOT EXISTS snapshot_course   ON snapshot (course_id, key, day);
 
 def db_path():
     return os.path.join(base_context.cs_data_root, "_logs", "_analytics", "analytics.db")
+
+
+def _dedupe_events(conn):
+    """
+    Remove duplicate events left behind by overlapping syncs, keeping the
+    earliest row of each set.
+
+    Needed once, on stores created before the unique index existed: the index
+    cannot be built while duplicates are present.
+    """
+    have_index = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index'"
+        " AND name = 'event_natural_key'"
+    ).fetchone()
+    if have_index:
+        return 0
+    removed = conn.execute(
+        "DELETE FROM event WHERE rowid NOT IN ("
+        "  SELECT MIN(rowid) FROM event"
+        "  GROUP BY course_id, username, path, kind, action, ts,"
+        "           COALESCE(qname, '')"
+        ")"
+    ).rowcount
+    conn.commit()
+    return max(0, removed)
 
 
 def connect(readonly=False):
@@ -134,6 +167,12 @@ def connect(readonly=False):
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
     if not readonly:
+        # Existing stores may hold duplicates from before the unique index
+        # existed; they must go before the index can be created.
+        try:
+            _dedupe_events(conn)
+        except sqlite3.Error:
+            pass
         conn.executescript(_SCHEMA)
         conn.execute(
             "INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -186,9 +225,16 @@ def drop_events(conn, course, username, path):
 
 
 def insert_events(conn, events):
+    """
+    Insert events, ignoring any that are already present.
+
+    `OR IGNORE` against the natural-key index makes this safe to call twice
+    with the same records, which is the second line of defence behind the sync
+    lock: even if two syncs overlap, the store cannot end up double-counting.
+    """
     conn.executemany(
-        "INSERT INTO event (course_id, username, path, qname, kind, action, score, ts,"
-        " impersonated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO event (course_id, username, path, qname, kind,"
+        " action, score, ts, impersonated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         [
             (
                 e.course, e.username, encode_path(e.path), e.qname, e.kind,
