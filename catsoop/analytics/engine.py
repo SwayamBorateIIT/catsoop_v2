@@ -347,6 +347,11 @@ def question_difficulty(conn, course, include_impersonated=False, mastery=MASTER
 #: statistics beyond counting.  Classical item analysis often uses 0.27.
 DISCRIM_GROUP = 0.5
 
+#: Minimum attempts needed in *each* group before a gap is reported at all.
+#: Below this, one student moving changes the verdict, so there is nothing
+#: worth reporting rather than something uncertain.
+MIN_GROUP_ATTEMPTS = 3
+
 
 def question_discrimination(conn, course, include_impersonated=False,
                             mastery=MASTERY):
@@ -415,6 +420,9 @@ def question_discrimination(conn, course, include_impersonated=False,
     for key, rs in grouped.items():
         t = [r for r in rs if r["username"] in top]
         b = [r for r in rs if r["username"] in bottom]
+        if len(t) < MIN_GROUP_ATTEMPTS or len(b) < MIN_GROUP_ATTEMPTS:
+            # Too few attempts on either side for a gap to mean anything.
+            continue
         if not t or not b:
             continue        # not attempted by both groups; nothing to compare
         t_pass = sum(1 for r in t if r["score"] >= mastery) / len(t)
@@ -438,10 +446,25 @@ def question_discrimination(conn, course, include_impersonated=False,
     return out
 
 
-def discrimination_band(value):
-    """(label, status-colour-token) for a discrimination value."""
+def discrimination_band(value, group_n=None):
+    """
+    (label, status-colour-token) for a discrimination value.
+
+    `group_n` is the number of students per comparison group.  It matters
+    because the measure cannot resolve anything finer than one student: with
+    five students a side every gap is a multiple of 0.20, so a gap of -0.20
+    is one student and says nothing.  A gap within that resolution is
+    reported as inconclusive rather than given a verdict it cannot support.
+
+    Without this the panel labels a one-student difference "suspect", which
+    on a real cohort produced nine false alarms against one genuine case.
+    """
     if value is None:
         return "no data", "var(--ink-soft)"
+    if group_n:
+        resolution = 1.0 / group_n
+        if abs(value) <= resolution + 1e-9:
+            return "inconclusive", "var(--ink-soft)"
     if value < 0:
         return "suspect", "var(--critical)"
     if value < 0.20:

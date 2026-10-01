@@ -28,6 +28,7 @@ In every mode the page states when the numbers were last refreshed, so a
 cached view is never mistaken for a live one.
 """
 
+import threading
 import time
 
 from . import engine, render, store, sync
@@ -35,6 +36,30 @@ from .extract import ExtractionError
 
 STAFF_PERMISSION_DEFAULT = "admin"
 INLINE_BUDGET_DEFAULT = 200
+
+
+def _sync_in_background(course):
+    """
+    Start a sync without waiting for it.
+
+    The page then renders from whatever the store already holds, so a load
+    never waits on extraction.  This is only safe because `sync_course` takes
+    a lock: a burst of page loads starts one sync and the rest return
+    immediately rather than piling up.
+
+    The cost is that brand-new activity appears on the *next* load rather than
+    this one.  The banner says what the data is from, and "Refresh now" still
+    forces a synchronous sync for staff who need a guaranteed-current view.
+    """
+    def run():
+        try:
+            sync.sync_course(course, lock_timeout=0.1)
+        except Exception:
+            pass        # a failed background sync must not affect the page
+
+    threading.Thread(
+        target=run, name="csa-sync-%s" % course, daemon=True
+    ).start()
 
 
 def _cfg(ctx, name, default):
@@ -110,8 +135,22 @@ def _refresh(ctx, course):
 
     if pending == 0 and not forced:
         return None, None, 0
-    if mode == "inline" or forced or pending <= budget:
-        return sync.sync_course(course), None, pending
+    if forced or mode == "inline":
+        # An explicit refresh waits, so the staff member sees the result.
+        return (
+            sync.sync_course(course, lock_timeout=sync.INLINE_LOCK_TIMEOUT),
+            None,
+            pending,
+        )
+    if pending <= budget:
+        # Normal load: start the sync and render immediately.
+        _sync_in_background(course)
+        return (
+            None,
+            "%d log%s changed; a refresh is running in the background and will "
+            "show on your next load." % (pending, "" if pending == 1 else "s"),
+            pending,
+        )
     return (
         None,
         "%d logs have changed since the last sync -- more than the inline "
